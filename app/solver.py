@@ -130,11 +130,27 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 DFS，每条路径候选按字典序展开，首个达到更优总长度的完整方案即字典序
 最小者；配合「当前长度 + 剩余设备各自最短路径长度」的总长度乐观下界
 剪枝（等长只会落在字典序更靠后的方案上，剪枝安全）与失败状态记忆化。
+
+仪表校准预演（solve_meter_calibration）：对已有可行分配的记录提交 3~8 组
+仪表快照，每组给出当时在线的记录内设备编号与仪表三个通道的非负整数读数；
+设备沿用记录功率与固定相位。三通道与 A/B/C 相一一对应，且每相存在跨快照
+不变的非负整数底载：若通道 c 对应相 p，则通道 c 在快照 t 的预测读数为
+「该相在线设备功率之和 + 底载 b_p」。目标依次为 1) 全部读数绝对误差的
+最大值最小；2) 绝对误差总和最小；3) 同值时按 A/B/C 对应的通道序列、
+底载序列字典序裁决。通道对应（仅 3!=6 种）确定后各相完全解耦：对每相，
+令 d_t = 通道读数 - 该相在线功率和，问题化为以非负整数 b 拟合常数
+（误差即 |d_t - b|）——无整数约束时最小最大误差由最小、最大 d 决定，
+与非负轴相交即取该值，否则只能取 b=0；给定最大误差预算后，总误差最小
+的 b 为整数中位数，落在预算可行区间之外时取区间上 / 下端（同时保证
+「同总误差取最小 b」）。故先枚举 6 种对应求全局最小最大误差 M*，再在
+M* 预算下按通道序列字典序枚举对应、各相独立选最优底载，首个总误差
+最小的方案即字典序裁决结果。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import permutations
 from math import ceil
 from typing import Iterable, Optional
 
@@ -2261,4 +2277,216 @@ def solve_maintenance_schedule(
         slot_loads=tuple(slot_loads),
         completion_slot=completion,
         reason=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 仪表校准预演
+# ---------------------------------------------------------------------------
+
+# 仪表三个通道按输入顺序编号 1/2/3；通道与 A/B/C 相的一一对应为 3! 种排列
+METER_CHANNELS: tuple[int, int, int] = (1, 2, 3)
+
+
+@dataclass(frozen=True)
+class MeterCalibrationDevice:
+    """仪表校准预演中的设备（沿用可行计算记录的功率与固定相位）。"""
+
+    code: str  # 设备唯一编号
+    phase: str  # 固定接入相位（A/B/C，沿用原计算记录）
+    power: int  # 记录功率（正整数）
+
+
+@dataclass(frozen=True)
+class MeterSnapshot:
+    """一组仪表快照：当时在线的记录内设备与三通道读数。"""
+
+    online: tuple[str, ...]  # 当时在线的设备编号（均属于计算记录）
+    readings: tuple[int, int, int]  # 三个通道（1/2/3）的非负整数读数
+
+
+@dataclass(frozen=True)
+class MeterCalibrationSnapshotResult:
+    """单组快照的校准结果。
+
+    online：在线设备编号（按编号排序）；observed_readings：三通道实测读数；
+    phase_power：A/B/C 各相在线设备功率之和；predicted_readings / errors：
+    按通道 1/2/3 排列的预测读数（在线设备功率之和 + 该相底载）与绝对误差。
+    """
+
+    online: tuple[str, ...]
+    observed_readings: tuple[int, int, int]
+    phase_power: dict[str, int]  # 相位 -> 该相在线设备功率之和
+    predicted_readings: tuple[int, int, int]  # 通道 1/2/3 的预测读数
+    errors: tuple[int, int, int]  # 通道 1/2/3 的绝对误差
+
+
+@dataclass(frozen=True)
+class MeterCalibrationResult:
+    """仪表校准预演结果。
+
+    channel_of_phase：A/B/C 各相对应的仪表通道（1/2/3）；base_loads：
+    各相跨快照不变的非负整数底载；snapshots：逐快照预测读数与误差；
+    max_error / total_error：全部读数绝对误差的最大值 / 总和。
+    """
+
+    channel_of_phase: dict[str, int]
+    base_loads: dict[str, int]
+    snapshots: tuple[MeterCalibrationSnapshotResult, ...]
+    max_error: int
+    total_error: int
+
+
+def _nonnegative_min_max_error(deltas: list[int]) -> int:
+    """非负整数底载 b 下，min_b max_t |d_t - b| 的值（d_t 可为任意整数）。
+
+    无整数约束时最优区间为 [(min d + max d - 1)//2, (min d + max d)//2]，
+    其与非负整数轴的交集非空时取区间最小误差；否则最优底载只能取 0，
+    误差为 max_t |d_t|。
+    """
+    lo, hi = min(deltas), max(deltas)
+    m = (hi - lo) - (hi - lo) // 2  # ceil((hi - lo) / 2)
+    if max(0, (lo + hi - 1) // 2) <= (lo + hi) // 2:
+        return m
+    return max(abs(lo), abs(hi))
+
+
+def _best_base(deltas: list[int], budget: int) -> int:
+    """给定每相最大误差预算 budget，返回总绝对误差最小的非负整数底载；
+    总误差相同时取最小底载（用于底载序列字典序裁决）。
+
+    预算约束可行区间：b ∈ [max_t(d_t - budget), min_t(d_t + budget)] ∩ Z≥0；
+    无约束总误差最小解集为整数中位数区间 [d_<, d_>]，最优底载按以下顺序取：
+    两区间交集的最小值 → 预算区间上端（小于中位数区间时）→ 预算区间下端。
+    """
+    low = max(0, max(deltas) - budget)
+    high = min(deltas) + budget
+    ordered = sorted(deltas)
+    median_low = ordered[(len(ordered) - 1) // 2]
+    median_high = ordered[len(ordered) // 2]
+    overlap_low = max(low, median_low)
+    if overlap_low <= min(high, median_high):
+        return overlap_low
+    if high < median_low:
+        return high
+    return low
+
+
+def solve_meter_calibration(
+    devices: Iterable[MeterCalibrationDevice],
+    snapshots: Iterable[MeterSnapshot],
+) -> MeterCalibrationResult:
+    """求解仪表校准预演：联合选择三通道与 A/B/C 相的对应关系及各相底载。
+
+    设备沿用计算记录的功率与固定相位；每组快照给出当时在线的记录内设备
+    编号与三通道非负整数读数。设通道 c 对应相 p，该相底载为跨快照不变的
+    非负整数 b_p，则通道 c 在快照 t 的预测读数为
+    「该相在线设备功率之和 + b_p」。目标依次为：
+    1) 最小化全部快照、全部通道读数绝对误差的最大值；
+    2) 再最小化绝对误差总和；
+    3) 同值时先按 A/B/C 对应的通道序列字典序、再按 A/B/C 底载序列字典序。
+
+    求解（详见模块 docstring）：通道对应确定后各相完全解耦——每相的最小
+    最大误差仅取决于「读数减在线功率和」序列 d。故第一遍枚举按字典序排列
+    的 3! 种通道对应，求全局最小最大误差 M*；第二遍在 M* 预算下枚举各对应，
+    每相独立以「总误差最小、底载最小」求最优底载，首个达到最小总误差的
+    对应（通道序列字典序最小）及其底载（底载序列字典序最小）即裁决结果。
+
+    :param devices: 记录内全部设备（编号唯一、相位为 A/B/C、功率为正整数）。
+    :param snapshots: 3~8 组快照，在线编号均属于设备集合且组内不重复。
+    :return: MeterCalibrationResult。
+    """
+    device_list = sorted(devices, key=lambda d: d.code)
+    phase_of = {d.code: d.phase for d in device_list}
+    power_of = {d.code: d.power for d in device_list}
+    snapshot_list = list(snapshots)
+
+    # 各快照各相在线设备功率之和
+    phase_powers: list[dict[str, int]] = []
+    for snapshot in snapshot_list:
+        totals = {p: 0 for p in PHASES}
+        for code in snapshot.online:
+            totals[phase_of[code]] += power_of[code]
+        phase_powers.append(totals)
+
+    # 全部 3! 种通道对应（permutations 已按元组字典序产生）：
+    # perm[i] 为 PHASES[i]（A/B/C）对应的通道
+    perms = list(permutations(METER_CHANNELS))
+
+    def deltas_for(perm: tuple[int, ...], phase_index: int) -> list[int]:
+        """该通道对应下，某相各快照「通道读数 - 该相在线功率和」序列。"""
+        channel_index = perm[phase_index] - 1
+        return [
+            snapshot_list[t].readings[channel_index] - phase_powers[t][PHASES[phase_index]]
+            for t in range(len(snapshot_list))
+        ]
+
+    # 第一遍：求全局最小最大误差
+    global_max: Optional[int] = None
+    for perm in perms:
+        candidate_max = max(
+            _nonnegative_min_max_error(deltas_for(perm, i)) for i in range(3)
+        )
+        if global_max is None or candidate_max < global_max:
+            global_max = candidate_max
+
+    assert global_max is not None  # perms 非空
+    best_max = global_max
+
+    # 第二遍：在最优最大误差预算下求最小总误差；排列按通道序列字典序枚举，
+    # 仅总误差严格更优才更新——同值时先枚举到的对应字典序最小；每相底载取
+    # 「总误差最小且底载最小」者，即同对应下底载序列字典序最小者。
+    best_total: Optional[int] = None
+    best_perm: Optional[tuple[int, ...]] = None
+    best_bases: Optional[tuple[int, int, int]] = None
+    for perm in perms:
+        deltas_per_phase = [deltas_for(perm, i) for i in range(3)]
+        if any(
+            _nonnegative_min_max_error(deltas) > best_max
+            for deltas in deltas_per_phase
+        ):
+            continue
+        bases = tuple(
+            _best_base(deltas, best_max) for deltas in deltas_per_phase
+        )
+        total = sum(
+            abs(deltas[t] - base)
+            for deltas, base in zip(deltas_per_phase, bases)
+            for t in range(len(snapshot_list))
+        )
+        if best_total is None or total < best_total:
+            best_total = total
+            best_perm = perm
+            best_bases = bases
+
+    assert best_perm is not None and best_bases is not None
+    channel_of_phase = {PHASES[i]: best_perm[i] for i in range(3)}
+    base_loads = {PHASES[i]: best_bases[i] for i in range(3)}
+
+    snapshot_results: list[MeterCalibrationSnapshotResult] = []
+    for t, snapshot in enumerate(snapshot_list):
+        online = tuple(sorted(snapshot.online))
+        totals = phase_powers[t]
+        predicted = [0, 0, 0]
+        errors = [0, 0, 0]
+        for i, phase in enumerate(PHASES):
+            channel_index = best_perm[i] - 1
+            value = totals[phase] + best_bases[i]
+            predicted[channel_index] = value
+            errors[channel_index] = abs(snapshot.readings[channel_index] - value)
+        snapshot_results.append(
+            MeterCalibrationSnapshotResult(
+                online=online,
+                observed_readings=tuple(snapshot.readings),
+                phase_power=dict(totals),
+                predicted_readings=tuple(predicted),
+                errors=tuple(errors),
+            )
+        )
+    return MeterCalibrationResult(
+        channel_of_phase=channel_of_phase,
+        base_loads=base_loads,
+        snapshots=tuple(snapshot_results),
+        max_error=best_max,
+        total_error=best_total,
     )

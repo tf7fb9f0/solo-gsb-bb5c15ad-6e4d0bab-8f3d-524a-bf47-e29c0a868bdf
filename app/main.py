@@ -32,6 +32,10 @@ from .schemas import (
     MaintenanceScheduleRequest,
     MaintenanceScheduleResultResponse,
     MaintenanceSlotLoad,
+    MeterCalibrationRequest,
+    MeterCalibrationResultResponse,
+    MeterCalibrationSnapshotOut,
+    MeterChannelMapping,
     Phase,
     PhaseFaultRehearsalResult,
     PowerLogAlertItem,
@@ -58,6 +62,8 @@ from .solver import (
     FaultRehearsalDevice,
     MaintenanceDevice,
     MaintenanceWindow,
+    MeterCalibrationDevice,
+    MeterSnapshot,
     PowerLogDevice,
     PowerLogEvent,
     RobustDevice,
@@ -69,6 +75,7 @@ from .solver import (
     solve_capacity_upgrade,
     solve_device_addition,
     solve_maintenance_schedule,
+    solve_meter_calibration,
     solve_phase_fault_rehearsal,
     solve_power_log_replay,
     solve_robust,
@@ -138,6 +145,11 @@ _MESSAGE_MAINTENANCE_FEASIBLE = (
     "字典序最小的目标下，找到每台选中设备各检修一次、每时隙同时检修数不超上限、"
     "各相在线负载不低于下限的排程"
 )
+_MESSAGE_METER_CALIBRATION = (
+    "预演成功：已联合选择三通道与 A/B/C 相的对应关系及各相跨快照不变的非负整数"
+    "底载，先最小化全部读数绝对误差的最大值、再最小化绝对误差总和，"
+    "同值按 A/B/C 对应的通道序列、底载序列字典序裁决"
+)
 
 
 @asynccontextmanager
@@ -198,6 +210,13 @@ app = FastAPI(
         "入所属相负载，先最小化最后完工时隙，同值时取按设备编号排序的开始时隙"
         "序列字典序最小者，返回检修安排与逐时隙各相在线负载，无可行排程时明确"
         "返回（仅预演，不修改历史记录）。"
+        "对已有可行分配的计算记录，还可做仪表校准预演：提交 3~8 组仪表快照，"
+        "每组列出当时在线的记录内设备编号与仪表三个通道的非负整数读数；设备"
+        "沿用记录功率与固定相位，假设三通道与 A/B/C 相一一对应且每相存在跨"
+        "快照不变的非负整数底载，联合选择通道对应与底载，先最小化所有读数与"
+        "「该相在线设备功率之和 + 底载」的最大绝对误差，再最小化绝对误差"
+        "总和，同值按 A/B/C 对应的通道序列、底载序列字典序裁决，返回对应"
+        "关系、底载与各快照预测读数及误差（仅预演，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -1187,4 +1206,89 @@ def maintenance_schedule(
         schedule=schedule,
         slot_loads=slot_loads,
         message=_MESSAGE_MAINTENANCE_FEASIBLE,
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/meter-calibration",
+    response_model=MeterCalibrationResultResponse,
+    tags=["calculations"],
+)
+def meter_calibration(
+    calculation_id: int, payload: MeterCalibrationRequest
+) -> MeterCalibrationResultResponse:
+    """仪表校准预演：用多组在线快照标定仪表通道与 A/B/C 相的对应及各相底载。
+
+    请求提交 3~8 组仪表快照，每组给出当时在线的记录内设备编号（均须存在于
+    计算记录中，组内不重复，可为空集）与仪表三个通道的非负整数读数（按
+    通道 1/2/3 排列）。设备沿用记录中的功率与固定相位。假设三通道与
+    A/B/C 相一一对应，且每相有跨快照不变的非负整数底载：若某通道对应相 p，
+    则其预测读数为「该相在线设备功率之和 + 该相底载」。联合选择通道对应
+    （3! 种）与三相底载，目标依次为：1) 最小化所有快照、所有通道读数绝对
+    误差的最大值；2) 再最小化绝对误差总和；3) 同值时先按 A/B/C 对应的
+    通道序列字典序、再按 A/B/C 底载序列字典序裁决。返回对应关系、底载及
+    各快照预测读数与误差。仅做预演，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配返回 409；快照数不在 3~8、在线
+    设备编号未知或组内重复、读数不是三个非负整数均返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法进行仪表校准预演：id={calculation_id}",
+        )
+
+    record_ids = {d["device_id"] for d in record["devices"]}
+    for index, snapshot in enumerate(payload.snapshots):
+        unknown = sorted(set(snapshot.online_device_ids) - record_ids)
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"第 {index + 1} 组快照包含未知设备编号：{', '.join(unknown)}"
+                ),
+            )
+
+    devices = [
+        MeterCalibrationDevice(
+            code=d["device_id"],
+            phase=d["assigned_phase"],
+            power=d["power"],
+        )
+        for d in record["devices"]
+    ]
+    snapshots = [
+        MeterSnapshot(
+            online=tuple(snapshot.online_device_ids),
+            readings=tuple(snapshot.readings),
+        )
+        for snapshot in payload.snapshots
+    ]
+    result = solve_meter_calibration(devices, snapshots)
+
+    snapshot_results = [
+        MeterCalibrationSnapshotOut(
+            online_device_ids=list(item.online),
+            observed_readings=list(item.observed_readings),
+            phase_power=Loads(**item.phase_power),
+            predicted_readings=list(item.predicted_readings),
+            errors=list(item.errors),
+        )
+        for item in result.snapshots
+    ]
+    return MeterCalibrationResultResponse(
+        id=record["id"],
+        created_at=record["created_at"],
+        channel_mapping=MeterChannelMapping(**result.channel_of_phase),
+        base_loads=Loads(**result.base_loads),
+        snapshots=snapshot_results,
+        max_error=result.max_error,
+        total_error=result.total_error,
+        message=_MESSAGE_METER_CALIBRATION,
     )

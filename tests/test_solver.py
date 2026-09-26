@@ -15,17 +15,22 @@ from app.solver import (
     FaultRehearsalDevice,
     MaintenanceDevice,
     MaintenanceWindow,
+    MeterCalibrationDevice,
+    MeterSnapshot,
     PowerLogDevice,
     PowerLogEvent,
     RobustDevice,
     ShiftDevice,
     StartupDevice,
+    _best_base,
+    _nonnegative_min_max_error,
     solve,
     solve_cable_cutting,
     solve_cable_routes,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_maintenance_schedule,
+    solve_meter_calibration,
     solve_phase_fault_rehearsal,
     solve_power_log_replay,
     solve_robust,
@@ -2824,6 +2829,261 @@ class MaintenanceScheduleRandomTest(unittest.TestCase):
                     self.assertGreaterEqual(loads[p], bounds[p])
             checked += 1
         self.assertGreater(checked, 50)
+
+
+# ---------------------------------------------------------------------------
+# 仪表校准预演
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_meter(devices, snapshots):
+    """朴素全枚举参照实现：按 (最大误差, 总误差, 通道序列, 底载序列) 求最优。"""
+    device_map = {d.code: d for d in devices}
+    t_count = len(snapshots)
+    phase_power = [{p: 0 for p in PHASES} for _ in range(t_count)]
+    for t, snapshot in enumerate(snapshots):
+        for code in snapshot.online:
+            phase_power[t][device_map[code].phase] += device_map[code].power
+
+    best = None
+    for perm in itertools.permutations((1, 2, 3)):
+        deltas_per_phase = [
+            [
+                snapshots[t].readings[perm[i] - 1] - phase_power[t][PHASES[i]]
+                for t in range(t_count)
+            ]
+            for i in range(3)
+        ]
+        # 各相底载独立上界：超过该相 max d 后其误差随底载严格单调增大
+        ranges = [range(0, max(0, max(ds)) + 1) for ds in deltas_per_phase]
+        for bases in itertools.product(*ranges):
+            errors = [
+                abs(deltas_per_phase[i][t] - bases[i])
+                for i in range(3)
+                for t in range(t_count)
+            ]
+            key = (max(errors), sum(errors), perm, bases)
+            if best is None or key < best:
+                best = key
+    return best
+
+
+class MeterCalibrationBasicTest(unittest.TestCase):
+    def test_exact_fit_recovers_mapping_and_bases(self):
+        # D1->A(10), D2->B(20), D3->C(30)，真实底载 (5,7,2)、通道 (1,2,3)
+        devices = [
+            MeterCalibrationDevice("D1", "A", 10),
+            MeterCalibrationDevice("D2", "B", 20),
+            MeterCalibrationDevice("D3", "C", 30),
+        ]
+        snapshots = [
+            MeterSnapshot(("D1",), (15, 7, 2)),
+            MeterSnapshot(("D2",), (5, 27, 2)),
+            MeterSnapshot(("D3",), (5, 7, 32)),
+            MeterSnapshot(("D1", "D2", "D3"), (15, 27, 32)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_of_phase, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 5, "B": 7, "C": 2})
+        self.assertEqual((result.max_error, result.total_error), (0, 0))
+        # 在线设备在结果中按编号排序
+        self.assertEqual(result.snapshots[0].online, ("D1",))
+        self.assertEqual(
+            result.snapshots[3].phase_power, {"A": 10, "B": 20, "C": 30}
+        )
+
+    def test_permuted_channels_recovered(self):
+        # 真实对应 A->3, B->1, C->2，底载 (0, 4, 9)
+        devices = [
+            MeterCalibrationDevice("D1", "A", 3),
+            MeterCalibrationDevice("D2", "B", 6),
+            MeterCalibrationDevice("D3", "C", 8),
+        ]
+        snapshots = [
+            MeterSnapshot(("D1",), (4, 9, 3)),
+            MeterSnapshot(("D2",), (10, 9, 0)),
+            MeterSnapshot(("D3",), (4, 17, 0)),
+            MeterSnapshot(("D1", "D2"), (10, 9, 3)),
+            MeterSnapshot(("D2", "D3"), (10, 17, 0)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_of_phase, {"A": 3, "B": 1, "C": 2})
+        self.assertEqual(result.base_loads, {"A": 0, "B": 4, "C": 9})
+        self.assertEqual((result.max_error, result.total_error), (0, 0))
+
+    def test_empty_online_snapshots_measure_bases_directly(self):
+        devices = [MeterCalibrationDevice("D1", "B", 11)]
+        snapshots = [
+            MeterSnapshot((), (3, 8, 1)),
+            MeterSnapshot(("D1",), (3, 19, 1)),
+            MeterSnapshot((), (3, 8, 1)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_of_phase, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 3, "B": 8, "C": 1})
+        self.assertEqual((result.max_error, result.total_error), (0, 0))
+
+    def test_channel_sequence_lexicographic_tie_break(self):
+        # 三相在线功率完全相同、读数完全相同：6 种对应同值，取通道序列 (1,2,3)
+        devices = [
+            MeterCalibrationDevice("D1", "A", 5),
+            MeterCalibrationDevice("D2", "B", 5),
+            MeterCalibrationDevice("D3", "C", 5),
+        ]
+        snapshots = [
+            MeterSnapshot(("D1",), (6, 1, 1)),
+            MeterSnapshot(("D2",), (1, 6, 1)),
+            MeterSnapshot(("D3",), (1, 1, 6)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_of_phase, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 1, "B": 1, "C": 1})
+
+    def test_bases_sequence_lexicographic_tie_break(self):
+        # 通道对应由各相读数唯一锁定（ch2/ch3 仅在 B/C 设备在线时读数为 1）；
+        # A 相 d 为 [10,20,0,0]，最大误差最优为 10 时底载被预算区间 [10,10]
+        # 唯一锁定为 10（非负中位数区间 [0,10] 的上端）。
+        devices = [
+            MeterCalibrationDevice("D1", "A", 1),
+            MeterCalibrationDevice("D2", "B", 1),
+            MeterCalibrationDevice("D3", "C", 1),
+        ]
+        snapshots = [
+            MeterSnapshot(("D1",), (11, 0, 0)),
+            MeterSnapshot(("D1",), (21, 0, 0)),
+            MeterSnapshot(("D2",), (0, 1, 0)),
+            MeterSnapshot(("D3",), (0, 0, 1)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_of_phase, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 10, "B": 0, "C": 0})
+        # A 相 d=[10,20,0,0]、底载 10：误差 0+10+10+10=30；B、C 误差为 0
+        self.assertEqual((result.max_error, result.total_error), (10, 30))
+
+    def test_nonnegative_base_helpers(self):
+        # 底载可负时最小最大误差由极差决定；与非负轴相交时不变
+        self.assertEqual(_nonnegative_min_max_error([5, 9]), 2)
+        self.assertEqual(_nonnegative_min_max_error([4, 5]), 1)
+        # d 全为负：非负底载只能取 0，误差为 max |d|
+        self.assertEqual(_nonnegative_min_max_error([-9, -5]), 9)
+        self.assertEqual(_nonnegative_min_max_error([-3, -3]), 3)
+
+        # 给定预算下总误差最小且底载最小
+        self.assertEqual(_best_base([5, 9], 2), 7)  # 中位数区间 [5,9]∩[7,11]
+        self.assertEqual(_best_base([4, 5], 1), 4)  # 中位数区间 [4,5]，取小
+        self.assertEqual(_best_base([-9, -5], 9), 0)  # 可行区间与非负轴交于 0
+        # 预算区间整体低于中位数区间：取区间上端（总误差随底载递增而减小）
+        self.assertEqual(_best_base([10, 20], 3), 17)
+        # 中位数为负、正离群点抬高预算：可行区间整体在中位数区间之上，取下端
+        self.assertEqual(_best_base([-5, -4, 100], 53), 47)
+
+    def test_predicted_and_errors_consistent(self):
+        devices = [
+            MeterCalibrationDevice("D1", "A", 10),
+            MeterCalibrationDevice("D2", "B", 20),
+        ]
+        snapshots = [
+            MeterSnapshot(("D1",), (14, 7, 2)),
+            MeterSnapshot(("D2",), (5, 26, 2)),
+            MeterSnapshot(("D1", "D2"), (15, 27, 3)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        observed_max = 0
+        observed_total = 0
+        for index, item in enumerate(result.snapshots):
+            observed = snapshots[index].readings
+            for channel in range(3):
+                self.assertEqual(
+                    item.errors[channel],
+                    abs(observed[channel] - item.predicted_readings[channel]),
+                )
+                observed_max = max(observed_max, item.errors[channel])
+                observed_total += item.errors[channel]
+        self.assertEqual(observed_max, result.max_error)
+        self.assertEqual(observed_total, result.total_error)
+
+
+class MeterCalibrationRandomTest(unittest.TestCase):
+    def test_random_instances_match_brute_force(self):
+        rng = random.Random(20260926)
+        checked = 0
+        for _ in range(150):
+            n = rng.randint(1, 5)
+            codes = [f"D{i:02d}" for i in range(n)]
+            devices = [
+                MeterCalibrationDevice(code, rng.choice(PHASES), rng.randint(1, 5))
+                for code in codes
+            ]
+            truth_bases = {p: rng.randint(0, 3) for p in PHASES}
+            truth_perm = {
+                p: ch for p, ch in zip(PHASES, random.sample((1, 2, 3), 3))
+            }
+            t_count = rng.randint(3, 5)
+            snapshots = []
+            for _ in range(t_count):
+                online = tuple(code for code in codes if rng.random() < 0.6)
+                totals = {p: 0 for p in PHASES}
+                for code in online:
+                    device = next(d for d in devices if d.code == code)
+                    totals[device.phase] += device.power
+                readings = [0, 0, 0]
+                for p in PHASES:
+                    channel = truth_perm[p] - 1
+                    noise = rng.choice([0, 0, 0, 1, -1, 2])
+                    readings[channel] = max(0, totals[p] + truth_bases[p] + noise)
+                snapshots.append(MeterSnapshot(online, tuple(readings)))
+
+            result = solve_meter_calibration(devices, snapshots)
+            expected_max, expected_total, expected_perm, expected_bases = (
+                _brute_force_meter(devices, snapshots)
+            )
+            self.assertEqual(result.max_error, expected_max)
+            self.assertEqual(result.total_error, expected_total)
+            self.assertEqual(
+                tuple(result.channel_of_phase[p] for p in PHASES), expected_perm
+            )
+            self.assertEqual(
+                tuple(result.base_loads[p] for p in PHASES), expected_bases
+            )
+            checked += 1
+        self.assertGreater(checked, 50)
+
+    def test_eight_snapshots_performance(self):
+        devices = [
+            MeterCalibrationDevice("D1", "A", 100),
+            MeterCalibrationDevice("D2", "B", 200),
+            MeterCalibrationDevice("D3", "C", 300),
+        ]
+        # 8 组快照，通道 1/2/3 对应 A/B/C、底载 5/7/2，读数含 ±3 噪声
+        observed = [
+            (105, 207, 302),
+            (108, 7, 2),
+            (5, 204, 2),
+            (5, 7, 299),
+            (102, 210, 2),
+            (105, 7, 305),
+            (5, 207, 299),
+            (108, 204, 302),
+        ]
+        online_sets = [
+            ("D1", "D2", "D3"),
+            ("D1",),
+            ("D2",),
+            ("D3",),
+            ("D1", "D2"),
+            ("D1", "D3"),
+            ("D2", "D3"),
+            ("D1", "D2", "D3"),
+        ]
+        snapshots = [
+            MeterSnapshot(online, readings)
+            for online, readings in zip(online_sets, observed)
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(len(result.snapshots), 8)
+        self.assertEqual(result.channel_of_phase, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 5, "B": 7, "C": 2})
+        self.assertEqual(result.max_error, 3)
 
 
 if __name__ == "__main__":
