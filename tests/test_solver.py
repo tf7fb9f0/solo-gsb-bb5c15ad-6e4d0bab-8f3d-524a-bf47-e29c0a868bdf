@@ -15,6 +15,8 @@ from app.solver import (
     FaultRehearsalDevice,
     MaintenanceDevice,
     MaintenanceWindow,
+    MeterDevice,
+    MeterSnapshot,
     PowerLogDevice,
     PowerLogEvent,
     RobustDevice,
@@ -26,6 +28,7 @@ from app.solver import (
     solve_capacity_upgrade,
     solve_device_addition,
     solve_maintenance_schedule,
+    solve_meter_calibration,
     solve_phase_fault_rehearsal,
     solve_power_log_replay,
     solve_robust,
@@ -2824,6 +2827,224 @@ class MaintenanceScheduleRandomTest(unittest.TestCase):
                     self.assertGreaterEqual(loads[p], bounds[p])
             checked += 1
         self.assertGreater(checked, 50)
+
+
+def _brute_force_meter(devices, snapshots):
+    """朴素全枚举参照实现：返回 (最大误差, 误差总和, 通道序列, 底载序列)。
+
+    枚举全部 6 种通道对应，并枚举各相 0..最大读数 的全部底载组合（底载超过
+    最大读数只会令所有误差单调变大，不可能最优）。
+    """
+    phase_of = {d.code: d.phase for d in devices}
+    power_of = {d.code: d.power for d in devices}
+    online_loads = []
+    for snap in snapshots:
+        row = {p: 0 for p in PHASES}
+        for code in snap.online:
+            row[phase_of[code]] += power_of[code]
+        online_loads.append(row)
+    max_reading = max(
+        reading for snap in snapshots for reading in snap.readings
+    )
+    best = None
+    for perm in itertools.permutations((1, 2, 3)):
+        for bases in itertools.product(range(max_reading + 1), repeat=3):
+            max_err = 0
+            total_err = 0
+            for s, snap in enumerate(snapshots):
+                for i, p in enumerate(PHASES):
+                    predicted = online_loads[s][p] + bases[i]
+                    err = abs(snap.readings[perm[i] - 1] - predicted)
+                    max_err = max(max_err, err)
+                    total_err += err
+            key = (max_err, total_err, perm, bases)
+            if best is None or key < best:
+                best = key
+    return best
+
+
+class MeterCalibrationTest(unittest.TestCase):
+    def _assert_snapshot_consistency(self, devices, snapshots, result):
+        phase_of = {d.code: d.phase for d in devices}
+        power_of = {d.code: d.power for d in devices}
+        phase_of_channel = {
+            channel: p for p, channel in result.channel_mapping.items()
+        }
+        self.assertEqual(
+            sorted(phase_of_channel), [1, 2, 3]
+        )  # 通道编号恰为 1/2/3
+        max_err = total_err = 0
+        for snap, item in zip(snapshots, result.snapshots):
+            row = {p: 0 for p in PHASES}
+            for code in snap.online:
+                row[phase_of[code]] += power_of[code]
+            for channel in (1, 2, 3):
+                p = phase_of_channel[channel]
+                predicted = row[p] + result.base_loads[p]
+                self.assertEqual(item.predicted[channel - 1], predicted)
+                err = abs(snap.readings[channel - 1] - predicted)
+                self.assertEqual(item.errors[channel - 1], err)
+                max_err = max(max_err, err)
+                total_err += err
+        self.assertEqual(result.max_error, max_err)
+        self.assertEqual(result.total_error, total_err)
+
+    def test_perfect_fit_identity_mapping(self):
+        devices = [
+            MeterDevice("D1", "A", 10),
+            MeterDevice("D2", "B", 20),
+            MeterDevice("D3", "C", 30),
+        ]
+        snapshots = [
+            MeterSnapshot(frozenset({"D1", "D2", "D3"}), (10, 20, 30)),
+            MeterSnapshot(frozenset({"D1"}), (10, 0, 0)),
+            MeterSnapshot(frozenset({"D2", "D3"}), (0, 20, 30)),
+            MeterSnapshot(frozenset(), (0, 0, 0)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_mapping, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 0, "B": 0, "C": 0})
+        self.assertEqual(result.max_error, 0)
+        self.assertEqual(result.total_error, 0)
+        for item in result.snapshots:
+            self.assertEqual(item.errors, (0, 0, 0))
+        self._assert_snapshot_consistency(devices, snapshots, result)
+
+    def test_perfect_fit_permuted_mapping(self):
+        devices = [
+            MeterDevice("D1", "A", 5),
+            MeterDevice("D2", "B", 7),
+        ]
+        # A 相在通道 3、B 相在通道 2、C 相在通道 1；底载全 0
+        snapshots = [
+            MeterSnapshot(frozenset({"D1", "D2"}), (0, 7, 5)),
+            MeterSnapshot(frozenset({"D1"}), (0, 0, 5)),
+            MeterSnapshot(frozenset({"D2"}), (0, 7, 0)),
+            MeterSnapshot(frozenset(), (0, 0, 0)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_mapping, {"A": 3, "B": 2, "C": 1})
+        self.assertEqual(result.base_loads, {"A": 0, "B": 0, "C": 0})
+        self.assertEqual(result.max_error, 0)
+        self.assertEqual(result.total_error, 0)
+        self._assert_snapshot_consistency(devices, snapshots, result)
+
+    def test_noisy_readings_median_base(self):
+        devices = [
+            MeterDevice("D1", "A", 10),
+            MeterDevice("D2", "B", 20),
+            MeterDevice("D3", "C", 30),
+        ]
+        snapshots = [
+            MeterSnapshot(frozenset({"D1", "D2", "D3"}), (13, 18, 32)),
+            MeterSnapshot(frozenset({"D1", "D2"}), (12, 22, 0)),
+            MeterSnapshot(frozenset({"D3"}), (0, 0, 30)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        # 通道 1/2/3 依次对应 A/B/C；d_A=[3,2,0] 取中位底载 2、
+        # d_B=[-2,2,0] 底载 0、d_C=[2,0,0] 底载 0；最大误差 2、总和 9
+        self.assertEqual(result.channel_mapping, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 2, "B": 0, "C": 0})
+        self.assertEqual(result.max_error, 2)
+        self.assertEqual(result.total_error, 9)
+        self.assertEqual(
+            [item.predicted for item in result.snapshots],
+            [(12, 20, 30), (12, 20, 0), (2, 0, 30)],
+        )
+        self.assertEqual(
+            [item.errors for item in result.snapshots],
+            [(1, 2, 2), (0, 2, 0), (2, 0, 0)],
+        )
+        self._assert_snapshot_consistency(devices, snapshots, result)
+
+    def test_base_load_non_negative_constraint(self):
+        # A 相设备在线时通道 1 读数仅 2（小于功率 10）：底载非负，最佳即底载 0
+        devices = [MeterDevice("D1", "A", 10)]
+        snapshots = [
+            MeterSnapshot(frozenset({"D1"}), (2, 0, 0)),
+            MeterSnapshot(frozenset(), (0, 0, 0)),
+            MeterSnapshot(frozenset({"D1"}), (2, 0, 0)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_mapping, {"A": 1, "B": 2, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 0, "B": 0, "C": 0})
+        self.assertEqual(result.max_error, 8)
+        self.assertEqual(result.total_error, 16)
+        self.assertEqual(
+            [item.errors for item in result.snapshots],
+            [(8, 0, 0), (0, 0, 0), (8, 0, 0)],
+        )
+        self._assert_snapshot_consistency(devices, snapshots, result)
+
+    def test_nonzero_base_load_with_empty_channel_tie(self):
+        # A 相真实对应通道 2，底载 5；通道 1/3 恒为 0，空相通道归 B/C 由
+        # 通道序列字典序裁决：A->2 固定后 (B,C) 取 (1,3)
+        devices = [MeterDevice("D1", "A", 10)]
+        snapshots = [
+            MeterSnapshot(frozenset({"D1"}), (0, 15, 0)),
+            MeterSnapshot(frozenset(), (0, 5, 0)),
+            MeterSnapshot(frozenset({"D1"}), (0, 15, 0)),
+            MeterSnapshot(frozenset(), (0, 5, 0)),
+        ]
+        result = solve_meter_calibration(devices, snapshots)
+        self.assertEqual(result.channel_mapping, {"A": 2, "B": 1, "C": 3})
+        self.assertEqual(result.base_loads, {"A": 5, "B": 0, "C": 0})
+        self.assertEqual(result.max_error, 0)
+        self.assertEqual(result.total_error, 0)
+        self._assert_snapshot_consistency(devices, snapshots, result)
+
+
+class MeterCalibrationFuzzTest(unittest.TestCase):
+    def test_random_instances_match_brute_force(self):
+        rng = random.Random(20260926)
+        for _ in range(150):
+            n = rng.randint(1, 5)
+            codes = [f"D{i:02d}" for i in range(n)]
+            devices = [
+                MeterDevice(code, rng.choice(PHASES), rng.randint(1, 12))
+                for code in codes
+            ]
+            s_count = rng.randint(3, 6)
+            snapshots = []
+            for _ in range(s_count):
+                online = frozenset(
+                    code for code in codes if rng.random() < 0.6
+                )
+                readings = tuple(rng.randint(0, 9) for _ in range(3))
+                snapshots.append(MeterSnapshot(online=online, readings=readings))
+
+            result = solve_meter_calibration(devices, snapshots)
+            exp_max, exp_total, exp_perm, exp_bases = _brute_force_meter(
+                devices, snapshots
+            )
+            self.assertEqual(result.max_error, exp_max)
+            self.assertEqual(result.total_error, exp_total)
+            self.assertEqual(
+                tuple(result.channel_mapping[p] for p in PHASES), exp_perm
+            )
+            self.assertEqual(
+                tuple(result.base_loads[p] for p in PHASES), exp_bases
+            )
+            for base in result.base_loads.values():
+                self.assertGreaterEqual(base, 0)
+            # 预测读数与绝对误差复核
+            phase_of = {d.code: d.phase for d in devices}
+            power_of = {d.code: d.power for d in devices}
+            phase_of_channel = {
+                channel: p for p, channel in result.channel_mapping.items()
+            }
+            for snap, item in zip(snapshots, result.snapshots):
+                row = {p: 0 for p in PHASES}
+                for code in snap.online:
+                    row[phase_of[code]] += power_of[code]
+                for channel in (1, 2, 3):
+                    p = phase_of_channel[channel]
+                    predicted = row[p] + result.base_loads[p]
+                    self.assertEqual(item.predicted[channel - 1], predicted)
+                    self.assertEqual(
+                        item.errors[channel - 1],
+                        abs(snap.readings[channel - 1] - predicted),
+                    )
 
 
 if __name__ == "__main__":

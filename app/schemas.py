@@ -815,3 +815,97 @@ class MaintenanceScheduleResultResponse(BaseModel):
         description="逐时隙各相在线负载（按时隙编号升序）；无解时为空",
     )
     message: str
+
+
+class MeterSnapshotIn(BaseModel):
+    """单组仪表快照：当时在线的记录内设备编号与仪表三个通道的读数。"""
+
+    online_device_ids: list[str] = Field(
+        ...,
+        max_length=12,
+        description="当时在线的记录内设备编号，不重复，均须存在于计算记录中；"
+        "可为空（表示该快照时刻无记录内设备在线）",
+    )
+    readings: list[int] = Field(
+        ...,
+        min_length=3,
+        max_length=3,
+        description="仪表通道 1/2/3 的非负整数读数（恰好 3 个，按通道顺序）",
+    )
+
+    @field_validator("readings")
+    @classmethod
+    def _readings_non_negative(cls, value: list[int]) -> list[int]:
+        if any(reading < 0 for reading in value):
+            raise ValueError("通道读数必须为非负整数")
+        return value
+
+    @model_validator(mode="after")
+    def _unique_and_bounded_ids(self) -> "MeterSnapshotIn":
+        ids = self.online_device_ids
+        if any(not device_id for device_id in ids):
+            raise ValueError("在线设备编号必须非空")
+        if len(ids) != len(set(ids)):
+            raise ValueError("同一快照内在线设备编号必须唯一")
+        return self
+
+
+class MeterCalibrationRequest(BaseModel):
+    """仪表校准预演请求体（仅预演，不修改历史计算记录）。"""
+
+    snapshots: list[MeterSnapshotIn] = Field(
+        ...,
+        min_length=3,
+        max_length=8,
+        description="3~8 组快照，按采集顺序给出；每组含当时在线的记录内设备编号"
+        "与仪表三个通道的非负整数读数",
+    )
+
+
+class PhaseChannelMapping(BaseModel):
+    """A/B/C 各相对应的仪表通道编号（1~3，一一对应）。"""
+
+    A: int = Field(..., ge=1, le=3, description="A 相对应的通道编号")
+    B: int = Field(..., ge=1, le=3, description="B 相对应的通道编号")
+    C: int = Field(..., ge=1, le=3, description="C 相对应的通道编号")
+
+
+class MeterSnapshotItem(BaseModel):
+    """单组快照的校准结果（回显输入，并给出三通道预测读数与绝对误差）。"""
+
+    online_device_ids: list[str] = Field(
+        ..., description="当时在线的记录内设备编号（回显请求输入）"
+    )
+    readings: list[int] = Field(
+        ..., description="仪表通道 1/2/3 的读数（回显请求输入）"
+    )
+    predicted: list[int] = Field(
+        ...,
+        description="通道 1/2/3 的预测读数（该通道对应相的在线设备功率之和 + 该相底载）",
+    )
+    errors: list[int] = Field(
+        ..., description="通道 1/2/3 的绝对误差 |读数 − 预测读数|"
+    )
+
+
+class MeterCalibrationResultResponse(BaseModel):
+    """仪表校准预演结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    channel_mapping: PhaseChannelMapping = Field(
+        ..., description="A/B/C 各相对应的仪表通道编号（一一对应）"
+    )
+    base_loads: Loads = Field(
+        ..., description="A/B/C 各相跨快照不变的非负整数底载"
+    )
+    max_error: int = Field(
+        ..., ge=0, description="所有快照所有通道读数与预测的最大绝对误差（首要优化目标）"
+    )
+    total_error: int = Field(
+        ..., ge=0, description="所有快照所有通道读数与预测的绝对误差总和（次要优化目标）"
+    )
+    snapshots: list[MeterSnapshotItem] = Field(
+        ..., description="各快照的预测读数与绝对误差（与请求中的快照顺序一致）"
+    )
+    message: str

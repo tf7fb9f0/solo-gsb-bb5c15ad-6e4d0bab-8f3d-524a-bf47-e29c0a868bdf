@@ -2386,3 +2386,245 @@ def test_maintenance_schedule_does_not_modify_record():
         f"/api/v1/calculations/{calc_id}/maintenance-schedule", json=body
     ).json()
     assert again == resp.json()
+
+
+METER_PAYLOAD = {
+    "capacities": {"A": 100, "B": 100, "C": 100},
+    "devices": [
+        {"id": "D1", "power": 10, "allowed_phases": ["A"]},
+        {"id": "D2", "power": 20, "allowed_phases": ["B"]},
+        {"id": "D3", "power": 30, "allowed_phases": ["C"]},
+    ],
+}
+
+
+def _meter_body(snapshots):
+    return {"snapshots": snapshots}
+
+
+def test_meter_calibration_success():
+    created = _create(METER_PAYLOAD)
+    calc_id = created["id"]
+    body = _meter_body(
+        [
+            {"online_device_ids": ["D1", "D2", "D3"], "readings": [13, 18, 32]},
+            {"online_device_ids": ["D1", "D2"], "readings": [12, 22, 0]},
+            {"online_device_ids": ["D3"], "readings": [0, 0, 30]},
+        ]
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/meter-calibration", json=body
+    )
+    assert resp.status_code == 200
+    result = resp.json()
+    assert result["id"] == calc_id
+    assert result["channel_mapping"] == {"A": 1, "B": 2, "C": 3}
+    assert result["base_loads"] == {"A": 2, "B": 0, "C": 0}
+    assert result["max_error"] == 2
+    assert result["total_error"] == 9
+    assert result["snapshots"] == [
+        {
+            "online_device_ids": ["D1", "D2", "D3"],
+            "readings": [13, 18, 32],
+            "predicted": [12, 20, 30],
+            "errors": [1, 2, 2],
+        },
+        {
+            "online_device_ids": ["D1", "D2"],
+            "readings": [12, 22, 0],
+            "predicted": [12, 20, 0],
+            "errors": [0, 2, 0],
+        },
+        {
+            "online_device_ids": ["D3"],
+            "readings": [0, 0, 30],
+            "predicted": [2, 0, 30],
+            "errors": [2, 0, 0],
+        },
+    ]
+    assert "预演" in result["message"]
+
+
+def test_meter_calibration_permuted_mapping():
+    payload = {
+        "capacities": {"A": 100, "B": 100, "C": 100},
+        "devices": [
+            {"id": "D1", "power": 5, "allowed_phases": ["A"]},
+            {"id": "D2", "power": 7, "allowed_phases": ["B"]},
+        ],
+    }
+    created = _create(payload)
+    # A 相在通道 3、B 相在通道 2、C 相在通道 1；底载全 0，误差为 0
+    body = _meter_body(
+        [
+            {"online_device_ids": ["D1", "D2"], "readings": [0, 7, 5]},
+            {"online_device_ids": ["D1"], "readings": [0, 0, 5]},
+            {"online_device_ids": ["D2"], "readings": [0, 7, 0]},
+            {"online_device_ids": [], "readings": [0, 0, 0]},
+        ]
+    )
+    result = client.post(
+        f"/api/v1/calculations/{created['id']}/meter-calibration", json=body
+    ).json()
+    assert result["channel_mapping"] == {"A": 3, "B": 2, "C": 1}
+    assert result["base_loads"] == {"A": 0, "B": 0, "C": 0}
+    assert result["max_error"] == 0
+    assert result["total_error"] == 0
+    assert result["snapshots"][-1]["predicted"] == [0, 0, 0]
+
+
+def test_meter_calibration_404():
+    body = _meter_body(
+        [
+            {"online_device_ids": [], "readings": [0, 0, 0]},
+            {"online_device_ids": [], "readings": [0, 0, 0]},
+            {"online_device_ids": [], "readings": [0, 0, 0]},
+        ]
+    )
+    resp = client.post(
+        "/api/v1/calculations/999999/meter-calibration", json=body
+    )
+    assert resp.status_code == 404
+
+
+def test_meter_calibration_409_when_record_infeasible():
+    payload = {
+        "capacities": {"A": 0, "B": 0, "C": 0},
+        "devices": [{"id": "BIG", "power": 50, "allowed_phases": ["A"]}],
+    }
+    created = _create(payload)
+    assert created["feasible"] is False
+    body = _meter_body(
+        [
+            {"online_device_ids": [], "readings": [0, 0, 0]},
+            {"online_device_ids": [], "readings": [0, 0, 0]},
+            {"online_device_ids": [], "readings": [0, 0, 0]},
+        ]
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/meter-calibration", json=body
+    )
+    assert resp.status_code == 409
+
+
+def test_meter_calibration_422_unknown_device():
+    created = _create(METER_PAYLOAD)
+    body = _meter_body(
+        [
+            {"online_device_ids": ["D1", "UNKNOWN"], "readings": [1, 2, 3]},
+            {"online_device_ids": ["D2"], "readings": [1, 2, 3]},
+            {"online_device_ids": ["D3"], "readings": [1, 2, 3]},
+        ]
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/meter-calibration", json=body
+    )
+    assert resp.status_code == 422
+    assert "未知设备编号" in resp.json()["detail"]
+
+
+def test_meter_calibration_422_validation():
+    created = _create(METER_PAYLOAD)
+    url = f"/api/v1/calculations/{created['id']}/meter-calibration"
+
+    # 快照少于 3 组
+    resp = client.post(
+        url,
+        json=_meter_body(
+            [
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+    # 快照超过 8 组
+    resp = client.post(
+        url,
+        json=_meter_body(
+            [{"online_device_ids": [], "readings": [0, 0, 0]} for _ in range(9)]
+        ),
+    )
+    assert resp.status_code == 422
+
+    # 读数不是恰好 3 个
+    resp = client.post(
+        url,
+        json=_meter_body(
+            [
+                {"online_device_ids": [], "readings": [0, 0]},
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        url,
+        json=_meter_body(
+            [
+                {"online_device_ids": [], "readings": [0, 0, 0, 0]},
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+    # 读数为负
+    resp = client.post(
+        url,
+        json=_meter_body(
+            [
+                {"online_device_ids": [], "readings": [-1, 0, 0]},
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+                {"online_device_ids": [], "readings": [0, 0, 0]},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+
+    # 同一快照内在线设备编号重复
+    resp = client.post(
+        url,
+        json=_meter_body(
+            [
+                {"online_device_ids": ["D1", "D1"], "readings": [0, 0, 0]},
+                {"online_device_ids": ["D2"], "readings": [0, 0, 0]},
+                {"online_device_ids": ["D3"], "readings": [0, 0, 0]},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+    assert "唯一" in resp.text
+
+
+def test_meter_calibration_does_not_modify_record():
+    created = _create(METER_PAYLOAD)
+    calc_id = created["id"]
+    before = client.get(f"/api/v1/calculations/{calc_id}").json()
+    count_before = len(client.get("/api/v1/calculations").json())
+
+    body = _meter_body(
+        [
+            {"online_device_ids": ["D1", "D2", "D3"], "readings": [13, 18, 32]},
+            {"online_device_ids": ["D1", "D2"], "readings": [12, 22, 0]},
+            {"online_device_ids": ["D3"], "readings": [0, 0, 30]},
+        ]
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/meter-calibration", json=body
+    )
+    assert resp.status_code == 200
+
+    # 预演不改历史：原记录内容与记录总数均不变
+    after = client.get(f"/api/v1/calculations/{calc_id}").json()
+    assert after == before
+    assert len(client.get("/api/v1/calculations").json()) == count_before
+
+    # 再次预演结果确定且相同（幂等读操作）
+    again = client.post(
+        f"/api/v1/calculations/{calc_id}/meter-calibration", json=body
+    ).json()
+    assert again == resp.json()

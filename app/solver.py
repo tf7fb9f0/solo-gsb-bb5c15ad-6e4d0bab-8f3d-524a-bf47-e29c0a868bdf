@@ -130,11 +130,25 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 DFS，每条路径候选按字典序展开，首个达到更优总长度的完整方案即字典序
 最小者；配合「当前长度 + 剩余设备各自最短路径长度」的总长度乐观下界
 剪枝（等长只会落在字典序更靠后的方案上，剪枝安全）与失败状态记忆化。
+
+仪表校准预演（solve_meter_calibration）：对已有可行分配的记录提交 3~8 组快照，
+每组给出当时在线的记录内设备与仪表三个通道的非负整数读数。设备沿用记录功率与
+固定相位；三通道与 A/B/C 相位一一对应（对应关系未知），每相另有跨快照不变的
+非负整数底载。给定通道对应后各相互不影响：对相位 p，令
+d_s = 该相对应通道在快照 s 的读数 − 快照 s 该相在线设备功率之和，则拟合为
+d_s ≈ b_p（b_p 为非负整数底载）。一级目标（该相最大绝对误差）的最优值
+m_p = max(ceil((max d_s − min d_s)/2), −min d_s)（后者来自底载非负约束）；
+全局最优最大误差 M* = max_p m_p。二级目标在「各相最大误差不超 M*」的底载区间
+[max(0, max d_s − M*), min d_s + M*] 内取绝对误差总和（关于 b 的凸函数，其
+无约束最小集为 d_s 的中位数区间）到该区间的投影点，即总和最小的非负整数底载；
+该点同时是同值底载集合的最左点。枚举全部 3!=6 种通道对应，以
+(最大误差, 误差总和, A/B/C 对应通道序列, A/B/C 底载序列) 为键取字典序最小者。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import permutations
 from math import ceil
 from typing import Iterable, Optional
 
@@ -2261,4 +2275,151 @@ def solve_maintenance_schedule(
         slot_loads=tuple(slot_loads),
         completion_slot=completion,
         reason=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 仪表校准预演
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MeterDevice:
+    """仪表校准预演中的设备（沿用可行计算记录的功率与固定相位）。"""
+
+    code: str  # 设备唯一编号
+    phase: str  # 固定接入相位（A/B/C，沿用原计算记录）
+    power: int  # 记录功率（正整数）
+
+
+@dataclass(frozen=True)
+class MeterSnapshot:
+    """一组仪表快照：当时在线的记录内设备与仪表三个通道的读数。"""
+
+    online: frozenset[str]  # 当时在线的设备编号集合（记录内设备，互不重复；可为空集）
+    readings: tuple[int, int, int]  # 通道 1/2/3 的非负整数读数
+
+
+@dataclass(frozen=True)
+class MeterSnapshotResult:
+    """单组快照的校准结果：三通道预测读数与绝对误差。"""
+
+    predicted: tuple[int, int, int]  # 通道 1/2/3 的预测读数（该相在线功率和 + 底载）
+    errors: tuple[int, int, int]  # 通道 1/2/3 的绝对误差 |读数 − 预测|
+
+
+@dataclass(frozen=True)
+class MeterCalibrationResult:
+    """仪表校准预演结果（任意输入均有校准方案，故无 feasible 字段）。"""
+
+    channel_mapping: dict[str, int]  # 相位 -> 通道编号（1/2/3，一一对应）
+    base_loads: dict[str, int]  # 相位 -> 跨快照不变的非负整数底载
+    max_error: int  # 所有快照所有通道读数与预测的最大绝对误差
+    total_error: int  # 所有快照所有通道读数与预测的绝对误差总和
+    snapshots: tuple[MeterSnapshotResult, ...]  # 各快照预测与误差（与输入顺序一致）
+
+
+def solve_meter_calibration(
+    devices: Iterable[MeterDevice],
+    snapshots: Iterable[MeterSnapshot],
+) -> MeterCalibrationResult:
+    """求解仪表校准预演：联合选择通道对应与各相底载，使读数拟合最优。
+
+    设备沿用记录功率与固定相位；三个通道与 A/B/C 相位一一对应（对应关系未知），
+    每相有跨快照不变的非负整数底载。对快照 s 与相位 p，预测对应通道读数为
+    「快照 s 该相在线设备功率之和 + 该相底载」。目标依次为：
+    1) 所有快照所有通道的「读数 − 预测」最大绝对误差最小；
+    2) 最大误差相同时，绝对误差总和最小；
+    3) 仍同值时，按 A/B/C 对应的通道序列、再按 A/B/C 底载序列取字典序最小者。
+
+    求解结构（详见模块 docstring）：给定通道对应后各相互不影响。对相位 p，令
+    d_s = 对应通道在快照 s 的读数 − 快照 s 该相在线设备功率之和，则底载 b 的
+    逐快照误差为 |d_s − b|。该相最大误差的最优值为
+    m_p = max(ceil((max d_s − min d_s)/2), −min d_s)（max(|min d_s − b|,
+    |max d_s − b|) 在 b ≥ 0 上的最小值），全局最优最大误差 M* = max_p m_p。
+    在「最大误差不超 M*」的底载区间 [max(0, max d_s − M*), min d_s + M*] 内，
+    绝对误差总和是 b 的凸函数，其无约束最小集为 d_s 的中位数区间，故约束最优
+    即中位数区间到该底载区间的投影点；该点同时是同值底载集合的最左点，天然
+    满足底载序列字典序裁决。枚举全部 6 种通道对应，以
+    (最大误差, 误差总和, 通道序列, 底载序列) 为键取字典序最小者。
+
+    :param devices: 设备集合（编号唯一、相位为 A/B/C、功率为正整数）。
+    :param snapshots: 3~8 组快照（在线编号均为记录内设备，读数为非负整数）。
+    :return: MeterCalibrationResult。
+    """
+    snaps = list(snapshots)
+    s_count = len(snaps)
+    device_by_code = {d.code: d for d in devices}
+
+    # online_loads[s][p]：快照 s 中 p 相在线设备功率之和
+    online_loads: list[dict[str, int]] = []
+    for snap in snaps:
+        row = {p: 0 for p in PHASES}
+        for code in snap.online:
+            device = device_by_code[code]
+            row[device.phase] += device.power
+        online_loads.append(row)
+
+    best_key: Optional[tuple] = None
+    best_mapping: Optional[dict[str, int]] = None
+    best_bases: Optional[dict[str, int]] = None
+    # 枚举三通道与 A/B/C 相位的一一对应：perm = (A 相通道, B 相通道, C 相通道)
+    for perm in permutations((1, 2, 3)):
+        # 每相的 d 序列：对应通道读数 − 该相在线设备功率之和
+        per_phase: dict[str, list[int]] = {}
+        for idx, phase in enumerate(PHASES):
+            channel = perm[idx]
+            per_phase[phase] = [
+                snaps[s].readings[channel - 1] - online_loads[s][phase]
+                for s in range(s_count)
+            ]
+        # 一级目标：该相最大误差最优值 m_p = max(ceil((hi−lo)/2), −lo)，
+        # 全局最优最大误差为各相 m_p 的最大值
+        max_error = 0
+        for phase in PHASES:
+            ds = per_phase[phase]
+            lo, hi = min(ds), max(ds)
+            max_error = max(max_error, (hi - lo + 1) // 2, -lo)
+        # 二级目标：各相在「最大误差不超 max_error」的底载区间内最小化误差总和
+        # （凸函数取中位数区间到约束区间的投影点，即同值底载集合的最左点）
+        total_error = 0
+        bases: dict[str, int] = {}
+        for phase in PHASES:
+            ds = per_phase[phase]
+            lo, hi = min(ds), max(ds)
+            bound_lo = max(0, hi - max_error)
+            bound_hi = lo + max_error
+            ordered_ds = sorted(ds)
+            median_lo = ordered_ds[(s_count - 1) // 2]
+            base = min(max(median_lo, bound_lo), bound_hi)
+            bases[phase] = base
+            total_error += sum(abs(d - base) for d in ds)
+        base_sequence = tuple(bases[p] for p in PHASES)
+        key = (max_error, total_error, perm, base_sequence)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_mapping = {p: perm[idx] for idx, p in enumerate(PHASES)}
+            best_bases = bases
+
+    assert best_mapping is not None and best_bases is not None and best_key is not None
+
+    # 由最优通道对应与底载构造各快照的三通道预测读数与绝对误差
+    phase_of_channel = {channel: p for p, channel in best_mapping.items()}
+    results: list[MeterSnapshotResult] = []
+    for s, snap in enumerate(snaps):
+        predicted = tuple(
+            online_loads[s][phase_of_channel[channel]]
+            + best_bases[phase_of_channel[channel]]
+            for channel in (1, 2, 3)
+        )
+        errors = tuple(
+            abs(snap.readings[idx] - predicted[idx]) for idx in range(3)
+        )
+        results.append(MeterSnapshotResult(predicted=predicted, errors=errors))
+    return MeterCalibrationResult(
+        channel_mapping=best_mapping,
+        base_loads=best_bases,
+        max_error=best_key[0],
+        total_error=best_key[1],
+        snapshots=tuple(results),
     )
